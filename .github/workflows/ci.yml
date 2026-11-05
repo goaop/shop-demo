@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    name: Smoke test (every mode, PHP ${{ matrix.php }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        php: ['8.4', '8.5']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          coverage: none
+          ini-values: opcache.enable_cli=1, opcache.jit=disable, opcache.file_update_protection=0
+      - run: composer install --no-interaction --no-progress
+      - name: Build the prebuilt cache
+        run: APP_MODE=prebuilt php vendor/bin/aspect cache:warmup:aop config/bootstrap.php --workers=2
+      - name: Run one request in every mode
+        run: |
+          for mode in baseline debug prod prebuilt; do
+            for run in cold warm; do
+              APP_MODE=$mode php public/index.php / > response.json
+              php -r '$r = json_decode(file_get_contents("response.json"), true, flags: JSON_THROW_ON_ERROR);
+                $s = $r["response"]["stats"]; $aop = $r["mode"] !== "baseline";
+                if ($r["response"]["checkout"]["placed"] !== 47 || ($aop && $s["log_records"] !== 800) || (!$aop && $s["log_records"] !== 0)) {
+                    fwrite(STDERR, json_encode($r) . "\n"); exit(1);
+                }
+                printf("%-8s %6.1f ms %4d files\n", $r["mode"], $r["timing"]["total_ms"], $r["included_files"]);'
+            done
+          done
+
+  docker:
+    name: Docker image (prebuilt cache, read-only root file system)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t shop-demo .
+      - name: Serve requests from a read-only container
+        run: |
+          docker run -d --name shop -p 8080:8080 --read-only --tmpfs /tmp shop-demo
+          for i in $(seq 1 30); do curl -fs 'http://127.0.0.1:8080/?mode=prebuilt' > /dev/null && break; sleep 1; done
+          for i in 1 2 3; do
+            curl -fs 'http://127.0.0.1:8080/?mode=prebuilt' | php -r '$r = json_decode(stream_get_contents(STDIN), true, flags: JSON_THROW_ON_ERROR);
+              printf("%6.1f ms %4d files\n", $r["timing"]["total_ms"], $r["included_files"]);'
+          done
+          docker logs shop
+
+  benchmark:
+    name: Benchmarks (manual)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.5'
+          coverage: none
+      - name: Install Xdebug, disabled (the profiler runs load it themselves)
+        run: |
+          sudo apt-get install -y php8.5-xdebug || true
+          sudo phpdismod -v 8.5 xdebug || true
+          php -m | grep -i xdebug || echo "Xdebug not enabled: OK"
+      - run: composer install --no-interaction --no-progress
+      - run: bash bench/run-all.sh
+      - name: Summary
+        run: |
+          {
+            echo '## Benchmark results'; echo
+            for f in wallclock startup cli autoloader micro; do echo "### $f"; echo '```'; cat "results/$f.txt"; echo '```'; done
+            [ -f results/profiles-comparison.md ] && { echo '### Profiles'; cat results/profiles-comparison.md; }
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: results/

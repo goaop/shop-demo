@@ -1,0 +1,7 @@
+.git
+vendor
+var
+results
+lib
+src/Module
+composer.lock
